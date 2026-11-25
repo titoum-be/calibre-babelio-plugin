@@ -29,9 +29,9 @@ _POLL_INTERVAL = 0.1
 
 
 class Babelio(Source):  # type: ignore[misc]
-    name = "Babelio"
+    name = "Babelio (WithLogin)"
     description = _("Downloads metadata and covers from Babelio (babelio.com)")
-    author = "Xavier Balloy"
+    author = "titoum"
     version = (0, 2, 0)
     minimum_calibre_version = (6, 0, 0)
 
@@ -101,7 +101,12 @@ class Babelio(Source):  # type: ignore[misc]
         from ._browser import CalibreBrowserAdapter
         from .client import BabelioClient
         from .config import prefs, worker_config_from_prefs
-        from .errors import BabelioBlocked, CircuitBreakerOpen, message_for_error
+        from .errors import (
+            BabelioBlocked,
+            BabelioLoginFailed,
+            CircuitBreakerOpen,
+            message_for_error,
+        )
         from .query import build_search_query
         from .search import search_books
         from .worker import Worker, WorkerContext
@@ -110,7 +115,10 @@ class Babelio(Source):  # type: ignore[misc]
             CalibreBrowserAdapter(self.browser),
             prefs["jsts_token"],
             prefs["user_agent"],
+            username=prefs["username"],
+            password=prefs["password"],
             min_interval=prefs["min_interval"],
+            search_interval=prefs["search_interval"],
         )
         ctx = WorkerContext(
             client=client,
@@ -135,9 +143,8 @@ class Babelio(Source):  # type: ignore[misc]
                 return None
             try:
                 hits = search_books(client, query)
-            except (BabelioBlocked, CircuitBreakerOpen) as exc:
+            except (BabelioBlocked, BabelioLoginFailed, CircuitBreakerOpen) as exc:
                 return message_for_error(exc)
-
             if not hits:
                 log.info("No Babelio search results for", query)
                 return None
@@ -149,29 +156,40 @@ class Babelio(Source):  # type: ignore[misc]
         return self._run_workers(workers, abort)
 
     def _run_workers(self, workers: list[Worker], abort: Event) -> str | None:
-        from .errors import BabelioTokenMissing, CircuitBreakerOpen, message_for_error
-
         for worker in workers:
             worker.start()
+
         while not abort.is_set() and any(worker.is_alive() for worker in workers):
             time.sleep(_POLL_INTERVAL)
 
         if abort.is_set():
             # Abandoned workers may still be writing `result`/`error`; don't read them.
             return None
+
         if any(worker.result is not None for worker in workers):
             return None
+
         if workers and all(worker.error is not None for worker in workers):
-            for worker in workers:
-                if isinstance(worker.error, CircuitBreakerOpen):
-                    return message_for_error(worker.error)
-            for worker in workers:
-                if isinstance(worker.error, BabelioTokenMissing):
-                    return message_for_error(worker.error)
-            error = workers[0].error
-            assert error is not None
-            return message_for_error(error)
+            return self._worker_error_message(workers)
+
         return None
+
+    @staticmethod
+    def _worker_error_message(workers: list[Worker]) -> str:
+        from .errors import (
+            BabelioLoginFailed,
+            BabelioTokenMissing,
+            CircuitBreakerOpen,
+            message_for_error,
+        )
+
+        for error_type in (CircuitBreakerOpen, BabelioLoginFailed, BabelioTokenMissing):
+            for worker in workers:
+                if isinstance(worker.error, error_type):
+                    return message_for_error(worker.error)
+        error = workers[0].error
+        assert error is not None
+        return message_for_error(error)
 
     def download_cover(
         self,
@@ -187,7 +205,12 @@ class Babelio(Source):  # type: ignore[misc]
         from ._browser import CalibreBrowserAdapter
         from .client import BabelioClient
         from .config import prefs
-        from .errors import BabelioBlocked, CircuitBreakerOpen, message_for_error
+        from .errors import (
+            BabelioBlocked,
+            BabelioLoginFailed,
+            CircuitBreakerOpen,
+            message_for_error,
+        )
 
         if not prefs["allow_covers"]:
             log.info("Cover download disabled in Babelio settings")
@@ -203,8 +226,10 @@ class Babelio(Source):  # type: ignore[misc]
                 identifiers=identifiers,
                 timeout=timeout,
             )
+
         if abort.is_set():
             return
+
         if cached_url is None:
             log.info("No Babelio cover found for", title)
             return
@@ -213,17 +238,21 @@ class Babelio(Source):  # type: ignore[misc]
             CalibreBrowserAdapter(self.browser),
             prefs["jsts_token"],
             prefs["user_agent"],
+            username=prefs["username"],
+            password=prefs["password"],
             min_interval=prefs["min_interval"],
+            search_interval=prefs["search_interval"],
         )
         log.info("Downloading Babelio cover from:", cached_url)
         try:
             cdata = client.fetch_image(cached_url, timeout=timeout)
-        except (BabelioBlocked, CircuitBreakerOpen) as exc:
+        except (BabelioBlocked, BabelioLoginFailed, CircuitBreakerOpen) as exc:
             log.error(message_for_error(exc))
             return
         except Exception:
             log.exception("Failed to download Babelio cover from:", cached_url)
             return
+
         if cdata:
             result_queue.put((self, cdata))
 
@@ -252,12 +281,14 @@ class Babelio(Source):  # type: ignore[misc]
         )
         if abort.is_set():
             return None
+
         results = []
         while True:
             try:
                 results.append(rq.get_nowait())
             except Empty:
                 break
+
         results.sort(
             key=self.identify_results_keygen(title=title, authors=authors, identifiers=identifiers)
         )
@@ -265,6 +296,7 @@ class Babelio(Source):  # type: ignore[misc]
             cached_url = self.get_cached_cover_url(mi.identifiers)
             if cached_url is not None:
                 return cached_url
+
         return None
 
 

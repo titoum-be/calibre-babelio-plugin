@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,13 +17,15 @@ from calibre_babelio.client import (
     _full_resolution_url,
     _SharedRequestState,
 )
-from calibre_babelio.errors import BabelioBlocked, BabelioTokenMissing, CircuitBreakerOpen
+from calibre_babelio.errors import BabelioBlocked, BabelioLoginFailed, CircuitBreakerOpen
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 _COVER_URL = "https://www.babelio.com/couv/CVT_CVT_Autre-Monde-Tome-5--Oz_6607.jpg"
+_LOGIN_URL = "https://www.babelio.com/connection.php"
+_LOGIN_POST_URL = "https://www.babelio.com/connection.php?r=1"
 
 
 class FakeResponse:
@@ -35,15 +38,22 @@ class FakeResponse:
 
 class FakeBrowser:
     def __init__(
-        self, body: bytes = b"", *, final_url: str = "", error: Exception | None = None
+        self,
+        body: bytes = b"",
+        *,
+        final_url: str = "",
+        error: Exception | None = None,
+        responder: Callable[[str, bytes | None, Mapping[str, str] | None], bytes] | None = None,
     ) -> None:
         self._body = body
         self._final_url = final_url
         self._error = error
+        self._responder = responder
         self.user_agent: str | None = None
         self.headers: dict[str, str] = {}
         self.cookies: list[tuple[str, str, str]] = []
         self.opened: list[str] = []
+        self.requests: list[tuple[str, bytes | None, dict[str, str]]] = []
 
     def set_user_agent(self, newval: str) -> None:
         self.user_agent = newval
@@ -62,17 +72,20 @@ class FakeBrowser:
         headers: Mapping[str, str] | None = None,
     ) -> FakeResponse:
         self.opened.append(url)
+        self.requests.append((url, data, dict(headers or {})))
         if self._error is not None:
             raise self._error
+        if self._responder is not None:
+            return FakeResponse(self._responder(url, data, headers))
         return FakeResponse(self._body)
 
     def geturl(self) -> str:
         return self._final_url
 
 
-def _client(browser: FakeBrowser, **kwargs: object) -> BabelioClient:
+def _client(browser: FakeBrowser, cookie: str = "token", **kwargs: object) -> BabelioClient:
     kwargs.setdefault("_shared", _SharedRequestState())
-    return BabelioClient(browser, "token", "UA/1.0", min_interval=0.0, **kwargs)  # type: ignore[arg-type]
+    return BabelioClient(browser, cookie, "UA/1.0", min_interval=0.0, **kwargs)  # type: ignore[arg-type]
 
 
 def _http_error(code: int) -> urllib.error.HTTPError:
@@ -101,9 +114,7 @@ def test_full_resolution_url(url: str, expected: str) -> None:
 def test_fetch_image_returns_body_and_sets_auth_headers() -> None:
     browser = FakeBrowser(b"\x89PNG-bytes", final_url=_COVER_URL)
     client = _client(browser)
-
     data = client.fetch_image(_COVER_URL, timeout=5.0)
-
     assert data == b"\x89PNG-bytes"
     assert browser.opened == [_COVER_URL]
     assert browser.user_agent == "UA/1.0"
@@ -113,66 +124,94 @@ def test_fetch_image_returns_body_and_sets_auth_headers() -> None:
 def test_fetch_image_strips_amazon_size_suffix() -> None:
     browser = FakeBrowser(b"img")
     client = _client(browser)
-
     client.fetch_image("https://m.media-amazon.com/I/51abc._SX318_.jpg")
-
     assert browser.opened == ["https://m.media-amazon.com/I/51abc.jpg"]
 
 
-def test_fetch_image_403_raises_blocked() -> None:
-    browser = FakeBrowser(error=_http_error(403))
-    client = _client(browser)
+def test_blank_or_whitespace_cookie_omits_jststoken_and_still_fetches() -> None:
+    for blank in ("", "   "):
+        browser = FakeBrowser(b"img", final_url=_COVER_URL)
+        client = _client(browser, cookie=blank)
+        assert client.fetch_image(_COVER_URL) == b"img"
+        assert browser.cookies == []
+        assert browser.opened == [_COVER_URL]
 
+
+def test_403_without_cookie_raises_babelio_blocked() -> None:
+    browser = FakeBrowser(error=_http_error(403))
+    client = _client(browser, cookie="")
     with pytest.raises(BabelioBlocked):
         client.fetch_image(_COVER_URL)
 
 
-def test_fetch_image_blank_cookie_raises_token_missing_without_network() -> None:
-    browser = FakeBrowser(b"img")
-    client = BabelioClient(browser, "", "UA/1.0", min_interval=0.0, _shared=_SharedRequestState())
-
-    with pytest.raises(BabelioTokenMissing):
-        client.fetch_image(_COVER_URL)
-
+def test_login_without_credentials_is_a_noop() -> None:
+    browser = FakeBrowser(b"<html></html>")
+    client = _client(browser, cookie="")
+    client.login()
     assert browser.opened == []
 
 
-def test_fetch_image_whitespace_only_cookie_raises_token_missing() -> None:
+def test_login_posts_credentials_once_and_reuses_session() -> None:
+    browser = FakeBrowser(b"<html>ok</html>", final_url="https://www.babelio.com/actualites.php")
+    client = _client(browser, cookie="", username="reader@example.com", password="secret")
+
+    client.login()
+    client.login()
+    client.get_book_page("Some-Book/123")
+
+    assert browser.opened == [
+        _LOGIN_URL,
+        _LOGIN_POST_URL,
+        "https://www.babelio.com/livres/Some-Book/123",
+    ]
+    _, post_data, post_headers = browser.requests[1]
+    assert post_data is not None
+    assert urllib.parse.parse_qs(post_data.decode("iso-8859-1")) == {
+        "Login": ["reader@example.com"],
+        "Password": ["secret"],
+        "sub_btn": ["connexion"],
+    }
+    assert post_headers == {"Referer": _LOGIN_URL}
+
+
+def test_fetch_on_babelio_auto_logins_once_and_skips_login_for_external_cdn() -> None:
     browser = FakeBrowser(b"img")
-    client = BabelioClient(
-        browser, "   ", "UA/1.0", min_interval=0.0, _shared=_SharedRequestState()
-    )
+    client = _client(browser, cookie="", username="reader", password="secret")
 
-    with pytest.raises(BabelioTokenMissing):
-        client.fetch_image(_COVER_URL)
+    # External CDN image fetch should not trigger a Babelio login.
+    client.fetch_image("https://m.media-amazon.com/I/51abc.jpg")
+    assert browser.opened == ["https://m.media-amazon.com/I/51abc.jpg"]
 
-    assert browser.opened == []
+    # First Babelio request triggers login once; second reuses the session.
+    client.get_book_page("Book-One/1")
+    client.get_book_page("Book-Two/2")
+    assert browser.opened == [
+        "https://m.media-amazon.com/I/51abc.jpg",
+        _LOGIN_URL,
+        _LOGIN_POST_URL,
+        "https://www.babelio.com/livres/Book-One/1",
+        "https://www.babelio.com/livres/Book-Two/2",
+    ]
 
 
-def test_blank_cookie_never_trips_the_circuit_breaker(tmp_path: Path) -> None:
-    lockfile = tmp_path / "circuit.lock"
-    browser = FakeBrowser(b"img")
-    client = BabelioClient(
-        browser,
-        "",
-        "UA/1.0",
-        min_interval=0.0,
-        lockfile_path=lockfile,
-        block_threshold=2,
-        _shared=_SharedRequestState(),
-    )
+def test_login_raises_on_auth_error_html() -> None:
+    def responder(url: str, data: bytes | None, headers: Mapping[str, str] | None) -> bytes:
+        if url == _LOGIN_POST_URL:
+            return b'<p class="auth-error" role="alert">Identifiant ou mot de passe incorrect.</p>'
+        return b"<html>login form</html>"
 
-    for _ in range(5):
-        with pytest.raises(BabelioTokenMissing):
-            client.fetch_image(_COVER_URL)
+    browser = FakeBrowser(responder=responder, final_url=_LOGIN_POST_URL)
+    client = _client(browser, cookie="", username="reader", password="wrong")
 
-    assert not lockfile.exists()
+    with pytest.raises(BabelioLoginFailed):
+        client.search("test")
+
+    assert browser.opened == [_LOGIN_URL, _LOGIN_POST_URL]
 
 
 def test_fetch_image_non_403_http_error_propagates() -> None:
     browser = FakeBrowser(error=_http_error(500))
     client = _client(browser)
-
     with pytest.raises(urllib.error.HTTPError):
         client.fetch_image(_COVER_URL)
 
@@ -187,7 +226,6 @@ def test_fetch_image_open_circuit_blocks_request(tmp_path: Path) -> None:
         cooldown=3600.0,
         _now_wall=lambda: lockfile.stat().st_mtime + 60.0,
     )
-
     with pytest.raises(CircuitBreakerOpen):
         client.fetch_image(_COVER_URL)
     assert browser.opened == []
@@ -196,9 +234,7 @@ def test_fetch_image_open_circuit_blocks_request(tmp_path: Path) -> None:
 def test_get_full_summary_posts_to_ajax_endpoint() -> None:
     browser = FakeBrowser(b"<p>full r\xe9sum\xe9</p>", final_url="https://final")
     client = _client(browser)
-
     result = client.get_full_summary(1, 918135, "https://ref")
-
     assert result.body == b"<p>full r\xe9sum\xe9</p>"
     assert browser.opened == ["https://www.babelio.com/aj_voir_plus_a.php"]
 
@@ -206,9 +242,7 @@ def test_get_full_summary_posts_to_ajax_endpoint() -> None:
 def test_get_author_bibliography_fetches_the_path_on_babelio() -> None:
     browser = FakeBrowser(b"<html>biblio</html>", final_url="https://final")
     client = _client(browser)
-
     result = client.get_author_bibliography("/auteur/Maxime-Chattam/2038/bibliographie")
-
     assert result.body == b"<html>biblio</html>"
     assert browser.opened == ["https://www.babelio.com/auteur/Maxime-Chattam/2038/bibliographie"]
 
@@ -226,10 +260,27 @@ def test_rate_limit_sleeps_when_requests_are_too_close(tmp_path: Path) -> None:
         _sleep=sleeps.append,
         _shared=_SharedRequestState(),
     )
-
     client.fetch_image(_COVER_URL)
-
     assert sleeps == [pytest.approx(0.6)]
+
+
+def test_search_interval_delays_consecutive_searches(tmp_path: Path) -> None:
+    sleeps: list[float] = []
+    clock_values = iter([10.0, 10.0, 11.5, 15.0])
+    client = BabelioClient(
+        FakeBrowser(b"<html></html>"),
+        "",
+        "UA/1.0",
+        min_interval=0.5,
+        search_interval=5.0,
+        lockfile_path=tmp_path / "circuit.lock",
+        _clock=lambda: next(clock_values),
+        _sleep=sleeps.append,
+        _shared=_SharedRequestState(),
+    )
+    client.search("first")
+    client.search("second")
+    assert sleeps == [pytest.approx(3.5)]
 
 
 def test_expired_circuit_lockfile_is_removed_and_request_proceeds(tmp_path: Path) -> None:
@@ -242,9 +293,7 @@ def test_expired_circuit_lockfile_is_removed_and_request_proceeds(tmp_path: Path
         cooldown=3600.0,
         _now_wall=lambda: lockfile.stat().st_mtime + 7200.0,
     )
-
     client.fetch_image(_COVER_URL)
-
     assert not lockfile.exists()
     assert browser.opened == [_COVER_URL]
 
@@ -253,11 +302,9 @@ def test_repeated_blocks_trip_the_circuit_breaker(tmp_path: Path) -> None:
     lockfile = tmp_path / "circuit.lock"
     browser = FakeBrowser(error=_http_error(403))
     client = _client(browser, lockfile_path=lockfile, block_threshold=2)
-
     for _ in range(2):
         with pytest.raises(BabelioBlocked):
             client.fetch_image(_COVER_URL)
-
     assert lockfile.exists()
     with pytest.raises(CircuitBreakerOpen):
         client.fetch_image(_COVER_URL)
@@ -265,39 +312,39 @@ def test_repeated_blocks_trip_the_circuit_breaker(tmp_path: Path) -> None:
 
 def test_connection_ok() -> None:
     client = _client(FakeBrowser(b"<html></html>", final_url=f"{_COVER_URL}"))
-
     result = client.test_connection()
-
     assert result.status is ConnectionStatus.OK
     assert result.ok
     assert result.detail == ""
 
 
-def test_connection_blank_cookie_returns_token_missing() -> None:
-    client = BabelioClient(
-        FakeBrowser(b""), "", "UA/1.0", min_interval=0.0, _shared=_SharedRequestState()
-    )
-
+def test_connection_ok_with_credentials_logs_in_and_searches() -> None:
+    browser = FakeBrowser(b"<html></html>", final_url="https://www.babelio.com/recherche")
+    client = _client(browser, cookie="", username="reader", password="secret")
     result = client.test_connection()
+    assert result.status is ConnectionStatus.OK
+    assert result.ok
+    assert browser.opened == [_LOGIN_URL, _LOGIN_POST_URL, "https://www.babelio.com/recherche"]
 
-    assert result.status is ConnectionStatus.TOKEN_MISSING
+
+def test_connection_invalid_credentials_returns_auth_failed() -> None:
+    browser = FakeBrowser(b'<p class="auth-error">bad</p>', final_url=_LOGIN_POST_URL)
+    client = _client(browser, cookie="", username="reader", password="wrong")
+    result = client.test_connection()
+    assert result.status is ConnectionStatus.AUTH_FAILED
     assert not result.ok
 
 
 def test_connection_blocked_returns_token_expired() -> None:
     client = _client(FakeBrowser(error=_http_error(403)))
-
     result = client.test_connection()
-
     assert result.status is ConnectionStatus.TOKEN_EXPIRED
     assert not result.ok
 
 
 def test_connection_unexpected_error_returns_error_status() -> None:
     client = _client(FakeBrowser(error=_http_error(500)))
-
     result = client.test_connection()
-
     assert result.status is ConnectionStatus.ERROR
     assert not result.ok
     assert result.detail  # raw exception text preserved for display
@@ -307,6 +354,7 @@ def test_connection_unexpected_error_returns_error_status() -> None:
     ("status", "expected_ok"),
     [
         (ConnectionStatus.OK, True),
+        (ConnectionStatus.AUTH_FAILED, False),
         (ConnectionStatus.TOKEN_MISSING, False),
         (ConnectionStatus.TOKEN_EXPIRED, False),
         (ConnectionStatus.CIRCUIT_OPEN, False),
@@ -352,7 +400,6 @@ class RaceDetectingBrowser(FakeBrowser):
 def test_clients_share_request_state_by_default() -> None:
     first = BabelioClient(FakeBrowser(), "token", "UA/1.0")
     second = BabelioClient(FakeBrowser(), "token", "UA/1.0")
-
     assert first._shared is second._shared is _SHARED_REQUEST_STATE
 
 
@@ -366,9 +413,7 @@ class VanishingLockfile(Path):
 def test_check_circuit_tolerates_lockfile_vanishing(tmp_path: Path) -> None:
     browser = FakeBrowser(b"img")
     client = _client(browser, lockfile_path=VanishingLockfile(tmp_path / "circuit.lock"))
-
     client.fetch_image(_COVER_URL)
-
     assert browser.opened == [_COVER_URL]
 
 
@@ -400,7 +445,6 @@ def test_concurrent_fetches_across_clients_are_serialized() -> None:
     shared = _SharedRequestState()
     clients = [_client(browser, _shared=shared) for _ in range(2)]
     ids = [f"Book-{n}/{n}" for n in range(8)]
-
     threads = [
         threading.Thread(target=clients[n % 2].get_book_page, args=(babelio_id,))
         for n, babelio_id in enumerate(ids)

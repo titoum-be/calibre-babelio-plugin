@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from calibre_babelio.errors import (
     BabelioBlocked,
+    BabelioLoginFailed,
     BabelioTokenMissing,
     CircuitBreakerOpen,
     circuit_open_message,
     cookie_expired_message,
+    login_failed_message,
     message_for_error,
     token_missing_message,
 )
@@ -13,15 +15,19 @@ from calibre_babelio.errors import (
 
 def test_cookie_expired_message_names_the_token_and_settings_path() -> None:
     message = cookie_expired_message()
-
     assert "jstsToken" in message
     assert "Configure" in message
 
 
 def test_token_missing_message_names_the_token_and_settings_path() -> None:
     message = token_missing_message()
-
     assert "jstsToken" in message
+    assert "Configure" in message
+
+
+def test_login_failed_message_names_credentials_and_settings_path() -> None:
+    message = login_failed_message()
+    assert "username or password" in message
     assert "Configure" in message
 
 
@@ -31,6 +37,10 @@ def test_circuit_open_message_explains_the_block() -> None:
 
 def test_message_for_error_maps_circuit_breaker_open() -> None:
     assert message_for_error(CircuitBreakerOpen(3600)) == circuit_open_message()
+
+
+def test_message_for_error_maps_login_failed() -> None:
+    assert message_for_error(BabelioLoginFailed("bad credentials")) == login_failed_message()
 
 
 def test_message_for_error_maps_token_missing() -> None:

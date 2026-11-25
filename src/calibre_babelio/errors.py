@@ -13,8 +13,9 @@ if TYPE_CHECKING:
 load_translations()
 
 _TOKEN_EXPIRED_MESSAGE = (
-    "Babelio rejected the configured jstsToken cookie: copy a fresh one from your browser "
-    "(DevTools → Application → Cookies → www.babelio.com → jstsToken) into plugin settings."
+    "Babelio blocked the request (HTTP 403): if jstsToken is configured, copy a fresh one from "
+    "your browser (DevTools → Application → Cookies → www.babelio.com → jstsToken) into plugin "
+    "settings."
 )
 
 _TOKEN_MISSING_MESSAGE = (
@@ -22,12 +23,16 @@ _TOKEN_MISSING_MESSAGE = (
     "(DevTools → Application → Cookies → www.babelio.com → jstsToken) into plugin settings."
 )
 
+_LOGIN_FAILED_MESSAGE = (
+    "Babelio rejected the configured username or password: check your credentials in plugin "
+    "settings."
+)
+
 
 def cookie_expired_message() -> str:
     return _(
-        "Babelio rejected the configured jstsToken cookie (it has likely expired): paste a "
-        "fresh one in the plugin settings (Preferences → Metadata download → Babelio → "
-        "Configure)."
+        "Babelio blocked the request (HTTP 403): paste a fresh jstsToken cookie in the plugin "
+        "settings (Preferences → Metadata download → Babelio → Configure)."
     )
 
 
@@ -38,16 +43,27 @@ def token_missing_message() -> str:
     )
 
 
+def login_failed_message() -> str:
+    return _(
+        "Babelio rejected the configured username or password: check your credentials in the "
+        "plugin settings (Preferences → Metadata download → Babelio → Configure)."
+    )
+
+
 def circuit_open_message() -> str:
     return _("Babelio access is temporarily blocked to avoid an IP ban; try again later.")
 
 
 class BabelioBlocked(Exception):
-    """Raised on HTTP 403: an expired or invalid `jstsToken`."""
+    """Raised on HTTP 403: Babelio challenged or rejected the request."""
 
 
 class BabelioTokenMissing(BabelioBlocked):
-    """Raised when no `jstsToken` is configured; no request is attempted."""
+    """Raised when no `jstsToken` is configured and one is required."""
+
+
+class BabelioLoginFailed(Exception):
+    """Raised when Babelio rejects the configured username or password."""
 
 
 class CircuitBreakerOpen(Exception):
@@ -65,6 +81,8 @@ class CircuitBreakerOpen(Exception):
 def message_for_error(error: BaseException) -> str:
     if isinstance(error, CircuitBreakerOpen):
         return circuit_open_message()
+    if isinstance(error, BabelioLoginFailed):
+        return login_failed_message()
     if isinstance(error, BabelioTokenMissing):
         return token_missing_message()
     return cookie_expired_message()

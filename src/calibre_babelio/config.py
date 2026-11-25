@@ -26,7 +26,12 @@ from qt.core import (
 )
 
 from .client import _DEFAULT_USER_AGENT, ConnectionResult, ConnectionStatus
-from .errors import circuit_open_message, cookie_expired_message, token_missing_message
+from .errors import (
+    circuit_open_message,
+    cookie_expired_message,
+    login_failed_message,
+    token_missing_message,
+)
 from .worker import WorkerConfig
 
 if TYPE_CHECKING:
@@ -34,10 +39,13 @@ if TYPE_CHECKING:
     def _(text: str) -> str: ...
 
 
-prefs = JSONConfig("plugins/babelio")
+prefs = JSONConfig("plugins/babelio_custom")
+prefs.defaults["username"] = ""
+prefs.defaults["password"] = ""
 prefs.defaults["jsts_token"] = ""
 prefs.defaults["user_agent"] = _DEFAULT_USER_AGENT
 prefs.defaults["min_interval"] = 1.2
+prefs.defaults["search_interval"] = 3.0
 prefs.defaults["max_results"] = 5
 prefs.defaults["comments"] = True
 prefs.defaults["pubdate"] = True
@@ -65,11 +73,23 @@ class _TestConnectionWorker(QThread):  # type: ignore[misc]
 
     result_ready = pyqtSignal(object)
 
-    def __init__(self, cookie: str, user_agent: str, min_interval: float, parent: QWidget) -> None:
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        cookie: str,
+        user_agent: str,
+        min_interval: float,
+        search_interval: float,
+        parent: QWidget,
+    ) -> None:
         super().__init__(parent)
+        self._username = username
+        self._password = password
         self._cookie = cookie
         self._user_agent = user_agent
         self._min_interval = min_interval
+        self._search_interval = search_interval
 
     def run(self) -> None:
         from calibre import browser
@@ -82,7 +102,10 @@ class _TestConnectionWorker(QThread):  # type: ignore[misc]
                 CalibreBrowserAdapter(browser()),
                 self._cookie,
                 self._user_agent,
+                username=self._username,
+                password=self._password,
                 min_interval=self._min_interval,
+                search_interval=self._search_interval,
             )
             result = client.test_connection()
         except Exception as exc:  # noqa: BLE001 - UI worker must never raise across the thread.
@@ -101,13 +124,13 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
         self._load_from_prefs()
 
     def _build_connection_group(self) -> QGroupBox:
-        group = QGroupBox(_("Babelio connection (anti-bot)"), self)
+        group = QGroupBox(_("Babelio connection"), self)
         outer = QVBoxLayout(group)
 
         help_label = QLabel(
             _(
-                "Babelio blocks automated requests. The <b>jstsToken</b> cookie proves a request "
-                "comes from a real logged-in browser session, so the plugin needs a copy of yours:"
+                "Enter your Babelio credentials (optional). If Babelio challenges your connection "
+                "with HTTP 403, you can also paste the <b>jstsToken</b> cookie from your browser:"
             )
             + "<ol>"
             + "<li>"
@@ -123,8 +146,8 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
             + _("Paste it below.")
             + "</li></ol>"
             + _(
-                "<i>This token expires after about 3 weeks; when imports start failing, repeat "
-                "these steps to paste a fresh one.</i>"
+                "<i>This token expires after about 3 weeks; when imports are blocked with 403, "
+                "repeat these steps to paste a fresh one.</i>"
             ),
             group,
         )
@@ -136,12 +159,23 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
         form = QFormLayout()
         outer.addLayout(form)
 
+        self.username = QLineEdit(group)
+        self.username.setPlaceholderText(_("Username or email (optional)"))
+        self.username.setToolTip(_("Your Babelio login username or email address."))
+        form.addRow(_("Babelio username:"), self.username)
+
+        self.password = QLineEdit(group)
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText(_("Password (optional)"))
+        self.password.setToolTip(_("Your Babelio account password."))
+        form.addRow(_("Babelio password:"), self.password)
+
         self.jsts_token = QLineEdit(group)
-        self.jsts_token.setPlaceholderText(_("Paste the jstsToken value here"))
+        self.jsts_token.setPlaceholderText(_("Paste the jstsToken value here (optional)"))
         self.jsts_token.setToolTip(
             _(
-                "The Babelio session cookie. Expires after about 3 weeks; paste a fresh one when "
-                "imports start failing."
+                "Optional anti-bot cookie needed only if Babelio blocks requests with HTTP 403. "
+                "Expires after about 3 weeks."
             )
         )
         form.addRow(_("Babelio cookie (jstsToken):"), self.jsts_token)
@@ -157,7 +191,7 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
         form.addRow(_("Browser User-Agent (optional):"), self.user_agent)
 
         self.min_interval = QDoubleSpinBox(group)
-        self.min_interval.setRange(0.5, 10.0)
+        self.min_interval.setRange(0.5, 60.0)
         self.min_interval.setSingleStep(0.1)
         self.min_interval.setSuffix(" s")
         self.min_interval.setToolTip(
@@ -167,6 +201,15 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
             )
         )
         form.addRow(_("Minimum delay between requests:"), self.min_interval)
+
+        self.search_interval = QDoubleSpinBox(group)
+        self.search_interval.setRange(0.0, 120.0)
+        self.search_interval.setSingleStep(0.5)
+        self.search_interval.setSuffix(" s")
+        self.search_interval.setToolTip(
+            _("Extra minimum delay between search requests (helps avoid anti-bot triggers).")
+        )
+        form.addRow(_("Minimum delay between searches:"), self.search_interval)
 
         test_row = QHBoxLayout()
         self.test_button = QPushButton(_("Test connection"), group)
@@ -223,9 +266,12 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
         return group
 
     def _load_from_prefs(self) -> None:
+        self.username.setText(prefs["username"])
+        self.password.setText(prefs["password"])
         self.jsts_token.setText(prefs["jsts_token"])
         self.user_agent.setText(prefs["user_agent"])
         self.min_interval.setValue(prefs["min_interval"])
+        self.search_interval.setValue(prefs["search_interval"])
         self.max_results.setValue(prefs["max_results"])
         self.comments.setChecked(prefs["comments"])
         self.pubdate.setChecked(prefs["pubdate"])
@@ -237,10 +283,16 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
         self.allow_covers.setChecked(prefs["allow_covers"])
 
     def _on_test_connection(self) -> None:
+        username = self.username.text().strip()
+        password = self.password.text()
         cookie = self.jsts_token.text().strip()
         user_agent = self.user_agent.text().strip() or _DEFAULT_USER_AGENT
-        if not cookie:
-            QMessageBox.warning(self, _("Test connection"), _("Enter a jstsToken cookie first."))
+        if bool(username) != bool(password):
+            QMessageBox.warning(
+                self,
+                _("Test connection"),
+                _("Enter both username and password, or leave both empty."),
+            )
             return
 
         self.test_button.setEnabled(False)
@@ -248,7 +300,13 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         self._test_worker = _TestConnectionWorker(
-            cookie, user_agent, self.min_interval.value(), self
+            username,
+            password,
+            cookie,
+            user_agent,
+            self.min_interval.value(),
+            self.search_interval.value(),
+            self,
         )
         self._test_worker.result_ready.connect(self._on_test_finished)
         self._test_worker.finished.connect(self._test_worker.deleteLater)
@@ -270,6 +328,8 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
 
     @staticmethod
     def _connection_error_message(status: ConnectionStatus, detail: str) -> str:
+        if status is ConnectionStatus.AUTH_FAILED:
+            return login_failed_message()
         if status is ConnectionStatus.TOKEN_MISSING:
             return token_missing_message()
         if status is ConnectionStatus.TOKEN_EXPIRED:
@@ -279,21 +339,30 @@ class ConfigWidget(QWidget):  # type: ignore[misc]
         return _("Connection failed: {error}").format(error=detail)
 
     def save_settings(self) -> None:
+        username = self.username.text().strip()
+        password = self.password.text()
         cookie = self.jsts_token.text().strip()
         user_agent = self.user_agent.text().strip()
-        if not cookie or not user_agent:
+
+        if bool(username) != bool(password):
             QMessageBox.warning(
                 self,
                 _("Babelio settings"),
-                _(
-                    "The Babelio cookie and User-Agent are both required for imports to work. "
-                    "Saving anyway, but identify will fail until they are filled in."
-                ),
+                _("Enter both username and password, or leave both empty."),
+            )
+        elif not user_agent:
+            QMessageBox.warning(
+                self,
+                _("Babelio settings"),
+                _("A Browser User-Agent is required for imports to work."),
             )
 
+        prefs["username"] = username
+        prefs["password"] = password
         prefs["jsts_token"] = cookie
         prefs["user_agent"] = user_agent
         prefs["min_interval"] = self.min_interval.value()
+        prefs["search_interval"] = self.search_interval.value()
         prefs["max_results"] = self.max_results.value()
         prefs["comments"] = self.comments.isChecked()
         prefs["pubdate"] = self.pubdate.isChecked()

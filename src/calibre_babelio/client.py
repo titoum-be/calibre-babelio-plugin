@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from .errors import (
+    _LOGIN_FAILED_MESSAGE,
     _TOKEN_EXPIRED_MESSAGE,
-    _TOKEN_MISSING_MESSAGE,
     BabelioBlocked,
-    BabelioTokenMissing,
+    BabelioLoginFailed,
     CircuitBreakerOpen,
 )
 
@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
 _BASE_URL = "https://www.babelio.com"
+_LOGIN_URL = f"{_BASE_URL}/connection.php"
+_LOGIN_POST_URL = f"{_LOGIN_URL}?r=1"
 _ACCEPT_LANGUAGE = "fr-FR,fr;q=0.9"
 _COOKIE_NAME = "jstsToken"
 _COOKIE_DOMAIN = "www.babelio.com"
@@ -36,11 +38,15 @@ _DEFAULT_USER_AGENT = (
 )
 
 _DEFAULT_MIN_INTERVAL = 1.2
+_DEFAULT_SEARCH_INTERVAL = 0.0
 _DEFAULT_BLOCK_THRESHOLD = 3
 _DEFAULT_COOLDOWN = 23 * 3600.0
 _CIRCUIT_LOCKFILE_NAME = "calibre_babelio_circuit_breaker.lock"
 
 _HTTP_FORBIDDEN = 403
+
+# Babelio returns HTTP 200 on failed login with `<p class="auth-error" role="alert">...`.
+_LOGIN_ERROR_RE = re.compile(rb'class=["\'][^"\']*\bauth-error\b')
 
 # Amazon image URLs encode a size in a modifier between the id and extension, e.g.
 # `...._SX318_BO1,204,203,200_.jpg`; dropping it yields the full-resolution original.
@@ -56,11 +62,12 @@ def _full_resolution_url(url: str) -> str:
 # browser, so the request lock must be process-wide: a per-client lock would let workers
 # surviving an aborted call race the next call's client through the same browser.
 class _SharedRequestState:
-    __slots__ = ("last_request_at", "request_lock")
+    __slots__ = ("last_request_at", "last_search_at", "request_lock")
 
     def __init__(self) -> None:
         self.request_lock = threading.Lock()
         self.last_request_at = 0.0
+        self.last_search_at: float | None = None
 
 
 _SHARED_REQUEST_STATE = _SharedRequestState()
@@ -92,6 +99,7 @@ class FetchResult:
 
 class ConnectionStatus(Enum):
     OK = "ok"
+    AUTH_FAILED = "auth_failed"
     TOKEN_MISSING = "token_missing"
     TOKEN_EXPIRED = "token_expired"
     CIRCUIT_OPEN = "circuit_open"
@@ -115,7 +123,10 @@ class BabelioClient:
         cookie: str,
         user_agent: str,
         *,
+        username: str = "",
+        password: str = "",
         min_interval: float = _DEFAULT_MIN_INTERVAL,
+        search_interval: float = _DEFAULT_SEARCH_INTERVAL,
         lockfile_path: Path | None = None,
         block_threshold: int = _DEFAULT_BLOCK_THRESHOLD,
         cooldown: float = _DEFAULT_COOLDOWN,
@@ -125,9 +136,12 @@ class BabelioClient:
         _shared: _SharedRequestState = _SHARED_REQUEST_STATE,
     ) -> None:
         self._browser = browser
-        self._cookie = cookie
+        self._cookie = cookie.strip()
         self._user_agent = user_agent
+        self._username = username.strip()
+        self._password = password
         self._min_interval = min_interval
+        self._search_interval = search_interval
         self._lockfile_path = lockfile_path or (
             Path(tempfile.gettempdir()) / _CIRCUIT_LOCKFILE_NAME
         )
@@ -138,6 +152,7 @@ class BabelioClient:
         self._now_wall = _now_wall
         self._shared = _shared
         self._consecutive_blocks = 0
+        self._logged_in = False
         self._lock = threading.Lock()
         self._setup_browser()
 
@@ -145,7 +160,26 @@ class BabelioClient:
         self._browser.set_user_agent(self._user_agent)
         self._browser.set_header("Accept-Language", _ACCEPT_LANGUAGE)
         # Host-only on www.babelio.com, not broadened to .babelio.com.
-        self._browser.set_simple_cookie(_COOKIE_NAME, self._cookie, _COOKIE_DOMAIN)
+        if self._cookie:
+            self._browser.set_simple_cookie(_COOKIE_NAME, self._cookie, _COOKIE_DOMAIN)
+
+    def _has_credentials(self) -> bool:
+        return bool(self._username and self._password)
+
+    def login(
+        self,
+        *,
+        timeout: float = 30.0,
+        record_blocks: bool = True,
+        check_circuit: bool = True,
+    ) -> None:
+        if not self._has_credentials():
+            return
+        if check_circuit:
+            self._check_circuit()
+        with self._shared.request_lock:
+            self._login_locked(timeout, record_blocks=record_blocks)
+        self._on_success()
 
     def get_book_page(self, babelio_id: str, *, timeout: float = 30.0) -> FetchResult:
         return self._fetch(f"{_BASE_URL}/livres/{babelio_id}", None, {}, timeout)
@@ -171,6 +205,7 @@ class BabelioClient:
             timeout,
             record_blocks=record_blocks,
             check_circuit=check_circuit,
+            is_search=True,
         )
 
     def fetch_image(self, url: str, *, timeout: float = 30.0) -> bytes:
@@ -189,12 +224,14 @@ class BabelioClient:
 
     def test_connection(self, *, timeout: float = 10.0) -> ConnectionResult:
         try:
+            if self._has_credentials():
+                self.login(timeout=timeout, record_blocks=False, check_circuit=False)
             self.search("test", timeout=timeout, record_blocks=False, check_circuit=False)
-        except BabelioTokenMissing:
-            return ConnectionResult(ConnectionStatus.TOKEN_MISSING)
+        except BabelioLoginFailed:
+            return ConnectionResult(ConnectionStatus.AUTH_FAILED)
         except BabelioBlocked:
             return ConnectionResult(ConnectionStatus.TOKEN_EXPIRED)
-        # Unreachable while the search above passes check_circuit=False; kept defensively.
+        # Unreachable while the calls above pass check_circuit=False; kept defensively.
         except CircuitBreakerOpen as exc:  # pragma: no cover
             return ConnectionResult(ConnectionStatus.CIRCUIT_OPEN, str(exc))
         except Exception as exc:  # noqa: BLE001 - UI button must report any failure, never raise.
@@ -210,31 +247,78 @@ class BabelioClient:
         *,
         record_blocks: bool = True,
         check_circuit: bool = True,
+        is_search: bool = False,
     ) -> FetchResult:
-        if not self._cookie.strip():
-            raise BabelioTokenMissing(_TOKEN_MISSING_MESSAGE)
         if check_circuit:
             self._check_circuit()
         with self._shared.request_lock:
-            self._wait_rate_limit()
-            try:
-                response = self._browser.open(url, data, timeout, headers=extra_headers)
-            except urllib.error.HTTPError as exc:
-                if exc.code == _HTTP_FORBIDDEN:
-                    self._on_block(record_blocks)  # raises BabelioBlocked
-                raise  # non-403 HTTPError surfaces unchanged
-            body = response.read()
-            final_url = self._browser.geturl()
+            if self._has_credentials() and not self._logged_in and url.startswith(_BASE_URL):
+                self._login_locked(timeout, record_blocks=record_blocks)
+            result = self._open_raw(
+                url, data, extra_headers, timeout, record_blocks=record_blocks, is_search=is_search
+            )
         self._on_success()
-        return FetchResult(body, final_url)
+        return result
 
-    def _wait_rate_limit(self) -> None:
-        # Caller holds `request_lock`, which is what guards `last_request_at`.
+    def _login_locked(self, timeout: float, *, record_blocks: bool) -> None:
+        # Caller holds `self._shared.request_lock`.
+        if self._logged_in:
+            return
+        # Prime the PHPSESSID cookie on the login page before submitting credentials.
+        self._open_raw(_LOGIN_URL, None, {}, timeout, record_blocks=record_blocks)
+        payload = urllib.parse.urlencode(
+            {
+                "Login": self._username,
+                "Password": self._password,
+                "sub_btn": "connexion",
+                "ref": "",
+            },
+            encoding=_BODY_ENCODING,
+        ).encode(_BODY_ENCODING)
+        result = self._open_raw(
+            _LOGIN_POST_URL,
+            payload,
+            {"Referer": _LOGIN_URL},
+            timeout,
+            record_blocks=record_blocks,
+        )
+        if _LOGIN_ERROR_RE.search(result.body) is not None:
+            raise BabelioLoginFailed(_LOGIN_FAILED_MESSAGE)
+        self._logged_in = True
+
+    def _open_raw(
+        self,
+        url: str,
+        data: bytes | None,
+        extra_headers: Mapping[str, str],
+        timeout: float,
+        *,
+        record_blocks: bool,
+        is_search: bool = False,
+    ) -> FetchResult:
+        # Caller holds `self._shared.request_lock`.
+        self._wait_rate_limit(is_search=is_search)
+        try:
+            response = self._browser.open(url, data, timeout, headers=extra_headers)
+        except urllib.error.HTTPError as exc:
+            if exc.code == _HTTP_FORBIDDEN:
+                self._on_block(record_blocks)  # raises BabelioBlocked
+            raise  # non-403 HTTPError surfaces unchanged
+        return FetchResult(response.read(), self._browser.geturl())
+
+    def _wait_rate_limit(self, *, is_search: bool = False) -> None:
+        # Caller holds `request_lock`, which is what guards `last_request_at` / `last_search_at`.
         shared = self._shared
-        elapsed = self._clock() - shared.last_request_at
-        if elapsed < self._min_interval:
-            self._sleep(self._min_interval - elapsed)
-        shared.last_request_at = self._clock()
+        now = self._clock()
+        wait = max(0.0, self._min_interval - (now - shared.last_request_at))
+        if is_search and shared.last_search_at is not None:
+            wait = max(wait, self._search_interval - (now - shared.last_search_at))
+        if wait > 0.0:
+            self._sleep(wait)
+        finished = self._clock()
+        shared.last_request_at = finished
+        if is_search:
+            shared.last_search_at = finished
 
     def _check_circuit(self) -> None:
         # Another thread can unlink the lockfile between any two filesystem calls.

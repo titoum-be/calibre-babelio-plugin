@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING, cast
 from calibre_babelio import Babelio
 from calibre_babelio.errors import (
     BabelioBlocked,
+    BabelioLoginFailed,
     BabelioTokenMissing,
     CircuitBreakerOpen,
     circuit_open_message,
     cookie_expired_message,
+    login_failed_message,
     token_missing_message,
 )
 
@@ -60,6 +62,16 @@ def test_run_workers_abort_returns_without_reading_results() -> None:
 
     assert message is None
     assert all(worker.started for worker in workers)
+
+
+def test_run_workers_login_failed_error_returns_login_failed_message() -> None:
+    plugin = Babelio()
+    abort = threading.Event()
+    workers = [StubWorker(error=BabelioLoginFailed("bad credentials"))]
+
+    message = plugin._run_workers(cast("list[Worker]", workers), abort)
+
+    assert message == login_failed_message()
 
 
 def test_run_workers_token_missing_error_returns_token_missing_message() -> None:

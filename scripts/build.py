@@ -12,10 +12,9 @@ ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "src" / "calibre_babelio"
 TRANSLATIONS = PACKAGE / "translations"
 DIST = ROOT / "dist"
-OUTPUT = DIST / "babelio.zip"
+OUTPUT = DIST / "babelioWithLogin.zip"
 
 LOCALES = ["fr"]
-
 _EXCLUDED_SUFFIXES = (".pyc", ".po", ".pot")
 _ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 
